@@ -1,0 +1,94 @@
+"""Centralized configuration for Secure RAG."""
+
+from typing import Any, Dict, Optional
+import os
+
+try:
+    from pydantic_settings import BaseSettings as _BaseSettings, SettingsConfigDict as _SettingsConfigDict
+    has_pydantic_settings = True
+except ImportError:
+    # Fallback implementation for compatibility with Pydantic 2.13+
+    class _FakeSettingsConfigDict(dict):
+        """Placeholder settings config."""
+        pass
+
+    class _BaseSettings:
+        """Minimal BaseSettings implementation."""
+        
+        def __init__(self, **data: Any) -> None:
+            # Initialize from environment variables or defaults
+            for key, value in data.items():
+                setattr(self, key, value)
+        
+        @classmethod
+        def model_config(cls):
+            return {}
+
+    class _SettingsConfigDict(_FakeSettingsConfigDict):
+        """Placeholder settings config."""
+        pass
+    
+    has_pydantic_settings = False
+
+
+class Settings:
+    """Настройки системы.
+
+    Attributes:
+        ollama_host: Ollama server host (default: localhost)
+        ollama_port: Ollama port (default: 11434)
+        default_model: Default model name (default: qwen2.5)
+        
+        chunk_size: Chunk size in tokens/symbols
+        chunk_overlap: Overlap between chunks
+        
+        top_k_results: Number of results for retrieval
+        similarity_threshold: Similarity threshold (0-1, default: 0.7)
+        max_prompt_chars: Maximum prompt length
+        
+        vector_db_path: ChromaDB collection path
+        security_config: ACL configuration path
+    """
+    
+    def __init__(self):
+        # Ollama settings
+        self.ollama_host = os.getenv("OLLAMA_HOST", "localhost")
+        self.ollama_port = int(os.getenv("OLLAMA_PORT", 11434))
+        
+        # Model configuration
+        self.default_model = os.getenv("DEFAULT_MODEL", "qwen2.5")
+        
+        # Chunking settings
+        self.chunk_size = int(os.getenv("CHUNK_SIZE", 500))
+        self.chunk_overlap = int(os.getenv("CHUNK_OVERLAP", 50))
+        
+        # Retrieval parameters
+        self.top_k_results = int(os.getenv("TOP_K_RESULTS", 5))
+        similarity_threshold_str = os.getenv("SIMILARITY_THRESHOLD", "0.7")
+        try:
+            self.similarity_threshold = float(similarity_threshold_str)
+        except ValueError:
+            self.similarity_threshold = 0.7
+        
+        # Prompt limits
+        self.max_prompt_chars = int(os.getenv("MAX_PROMPT_CHARS", 4096))
+        
+        # Paths
+        self.vector_db_path = os.path.join(
+            os.getcwd(), 
+            os.getenv("VECTOR_DB_PATH", "./chroma_db")
+        )
+        self.security_config = os.path.join(
+            os.getcwd(),
+            os.getenv("SECURITY_CONFIG", "./security/acl_storage.json")
+        )
+    
+    def validate_paths(self, path: str) -> str:
+        """Validate that a path is not empty."""
+        if not path or path.strip() == "":
+            raise ValueError("Path cannot be empty")
+        return os.path.abspath(path)
+
+
+# Global settings instance
+settings = Settings()

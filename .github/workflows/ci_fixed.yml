@@ -1,0 +1,53 @@
+﻿name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest pytest-cov ruff bandit trivy
+
+      - name: Lint (ruff)
+        run: ruff check secure_rag/
+
+      - name: Static analysis (bandit)
+        run: bandit -r secure_rag/ -ll
+
+      - name: Unit & integration tests
+        run: pytest tests/ -q --cov=secure_rag --cov-report=xml --cov-fail-under=85
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t secure-rag:${{ github.sha }} .
+
+      - name: Trivy vulnerability scan
+        run: trivy image --exit-code 1 --severity CRITICAL secure-rag:${{ github.sha }}
+
+      # Р”РµРїР»РѕР№ РІ air-gapped РєР»Р°СЃС‚РµСЂ РІС‹РїРѕР»РЅСЏРµС‚СЃСЏ РІСЂСѓС‡РЅСѓСЋ/С‡РµСЂРµР· РѕС‚РґРµР»СЊРЅС‹Р№
+      # Р·Р°С‰РёС‰С‘РЅРЅС‹Р№ СЂР°РЅРЅРµСЂ; Р·РґРµСЃСЊ С‚РѕР»СЊРєРѕ СЃР±РѕСЂРєР° Рё СЃРєР°РЅРёСЂРѕРІР°РЅРёРµ Р°СЂС‚РµС„Р°РєС‚Р°.

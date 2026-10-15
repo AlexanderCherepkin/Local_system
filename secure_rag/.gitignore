@@ -1,0 +1,30 @@
+# Environment variables (DO NOT COMMIT)
+.env
+.env.local
+.env.*
+*.local
+.venv/
+venv/
+ENV/
+
+# ChromaDB database (sensitive data)
+chroma_db/**
+!chroma_db/.gitkeep
+
+# Security configuration (may contain sensitive access control info)
+security/acl_storage.json
+
+# IDE and editor files
+.vscode/*
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python

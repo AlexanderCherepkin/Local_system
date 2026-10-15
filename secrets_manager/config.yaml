@@ -1,0 +1,21 @@
+# Secrets Manager Configuration
+vault:
+  db_path: "./data/secrets.db"
+  
+security:
+  # Master secret for key derivation (DO NOT COMMIT TO VERSION CONTROL)
+  master_secret_env_var: "VAULT_MASTER_SECRET"
+  
+encryption:
+  algorithm: "AES-256-GCM"
+  nonce_size: 12
+  
+persistence:
+  enabled: true
+  sync_interval_seconds: 60
+
+# Service-specific token prefixes (optional organization)
+token_prefixes:
+  openai: "sk-proj-"
+  anthropic: "sk-ant-"
+  postgres: ""

@@ -1,0 +1,38 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: secure_rag_ollama
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - internal_net
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: secure_rag_app
+    ports:
+      - "8000:8000"
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - HF_HUB_OFFLINE=1
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./audit_logs:/app/audit_logs
+    depends_on:
+      - ollama
+    networks:
+      - internal_net
+    restart: unless-stopped
+
+volumes:
+  ollama_data:
+
+networks:
+  internal_net:
+    internal: true # Полная изоляция без внешнего egress-трафика

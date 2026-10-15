@@ -1,0 +1,15 @@
+# Runtime-зависимости продублированы из pyproject.toml для air-gapped установки
+# через "pip install -r requirements.txt" (без доступа к PyPI index).
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+pydantic>=2.6.0
+pydantic-settings>=2.2.0
+chromadb>=0.4.24
+sentence-transformers>=2.5.1
+requests>=2.31.0
+python-multipart>=0.0.9
+
+# Dev / CI
+pytest>=8.0.0
+pytest-cov>=4.1.0
+ruff>=0.2.1

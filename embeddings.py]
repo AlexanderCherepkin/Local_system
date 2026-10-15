@@ -1,0 +1,2 @@
+        return self.model.encode(texts, show_progress_bar=False).tolist()
+        self._model = None

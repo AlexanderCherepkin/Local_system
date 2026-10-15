@@ -1,0 +1,17 @@
+{
+  "users": {
+    "admin": ["admin", "hr", "engineering"],
+    "john.doe": ["engineering"],
+    "jane.smith": ["hr"],
+    "hr_manager": ["hr_manager"],
+    "hr_analyst": ["hr_analyst"],
+    "hr_viewer": ["hr_viewer"]
+  },
+  "roles": {
+    "admin": ["read_all", "manage_system"],
+    "hr_manager": ["read_hr_docs", "manage_hr"],
+    "hr_analyst": ["read_hr_docs", "analyze_hr_docs"],
+    "hr_viewer": ["read_hr_docs"],
+    "engineering": ["read_engineering"]
+  }
+}

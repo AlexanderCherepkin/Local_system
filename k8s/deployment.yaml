@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secure-rag-app
+  namespace: secure-rag
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: secure-rag
+  template:
+    metadata:
+      labels:
+        app: secure-rag
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: app
+        image: secure-rag:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+        resources:
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8000
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        env:
+        - name: OLLAMA_HOST
+          value: "http://ollama:11434"
+        - name: AUDIT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: secure-rag-secrets
+              key: audit-secret
+        - name: AUTH_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: secure-rag-secrets
+              key: auth-secret
+        volumeMounts:
+        - name: model-storage
+          mountPath: /app/models
+        - name: data-storage
+          mountPath: /app/data
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: model-pvc
+      - name: data-storage
+        persistentVolumeClaim:
+          claimName: data-pvc
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: egress-deny-external
+  namespace: secure-rag
+spec:
+  podSelector:
+    matchLabels:
+      app: secure-rag
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          app: ollama

@@ -1,0 +1,49 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+ENV/
+build/
+dist/
+
+# System files (Windows)
+nul
+CON
+AUX
+PRN
+COM1
+COM2
+COM3
+COM4
+COM5
+COM6
+COM7
+COM8
+COM9
+LPT1
+LPT2
+LPT3
+LPT4
+LPT5
+LPT6
+LPT7
+LPT8
+LPT9
+
+# Database and data files (ChromaDB, SQLite)
+data/chroma_db/
+*.db
+*.sqlite3
+*.sqlite
+
+# Model weights and large caches
+models/
+embeddings/model_cache/
+
+# Environment variables / Secrets
+.env
+secrets/
+.secrets/

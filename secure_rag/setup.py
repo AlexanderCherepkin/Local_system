@@ -1,0 +1,20 @@
+from setuptools import setup, find_packages
+
+setup(
+    name='secure-rag-system',
+    version='0.1.0',
+    packages=find_packages(),
+    install_requires=[
+        'fastapi>=0.110.0',
+        'uvicorn[standard]>=0.28.0',
+        'pydantic>=2.6.0',
+        'pydantic-settings>=2.2.0',
+        'chromadb>=0.4.24',
+        'sentence-transformers>=2.5.1',
+        'requests>=2.31.0',
+        'python-multipart>=0.0.9',
+    ],
+    entry_points={
+        'console_scripts': ['secure-rag=secure_rag.cli:main'],
+    },
+)

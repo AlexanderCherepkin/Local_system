@@ -1,0 +1,503 @@
+"""Контроль доступа (ACL) для Secure RAG: строгая модель Zero-Trust.
+
+Ключевое отличие от прежней версии (F-05, F-06):
+
+* **Deny-by-default.** Пустая/отсутствующая роль пользователя или отсутствующие
+  ``allowed_roles`` у документа/чанка всегда приводят к отказу. Раньше в
+  ``pipeline/generator.py`` фильтр применялся только «если оба значения
+  truthy», поэтому чанк без ACL-метаданных проходил в контекст модели.
+* **Доверенная identity.** ``Principal`` создаётся только из проверенного
+  источника (серверная авторизация), а не из тела HTTP-запроса.
+* Единый вход для метаданных чанков: ``validate_chunk_metadata`` больше не
+  бросает исключение посреди ingestion, а возвращает вердикт; исключение
+  остаётся для явного контрактного нарушения.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set
+
+from config.settings import Settings, get_settings
+from .redaction import process_text
+
+logger = logging.getLogger("secure_rag.security.acl")
+
+#: Роль, которая по умолчанию получает доступ ко всему.
+SUPERUSER_ROLE = "admin"
+
+
+class ACLValidationError(Exception):
+    """Нарушение контракта ACL-метаданных (отсутствует/невалидно ``allowed_roles``)."""
+
+
+class AccessDeniedError(PermissionError):
+    """Запрос отклонён политикой Zero-Trust."""
+
+    def __init__(self, reason: str, user_id: Optional[str] = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.user_id = user_id
+
+
+@dataclass(frozen=True)
+class Principal:
+    """Удостоверенная личность.
+
+    ``user_id`` и ``roles`` должны приходить из доверенного серверного слоя
+    (JWT/OIDC/mTLS/gateway). Поле ``roles`` нормализуется: пробелы и пустые
+    значения отбрасываются, поэтому ``Principal(user_id="x", roles=["", None])``
+    эквивалентен отсутствию ролей и будет отклонён политикой.
+    """
+
+    user_id: str
+    roles: tuple[str, ...] = field(default_factory=tuple)
+    trusted: bool = True
+
+    def __post_init__(self) -> None:
+        user_id = (self.user_id or "").strip()
+        if not user_id:
+            raise ValueError("Principal требует непустой user_id")
+        roles = tuple(sorted({str(r).strip() for r in (self.roles or ()) if str(r or "").strip()}))
+        object.__setattr__(self, "user_id", user_id)
+        object.__setattr__(self, "roles", roles)
+
+    @property
+    def has_roles(self) -> bool:
+        return bool(self.roles)
+
+    def as_dict(self) -> Dict[str, Any]:
+        """Представление для аудита. Не содержит персональных данных кроме ID."""
+        return {"user_id": self.user_id, "roles": list(self.roles)}
+
+
+def require_principal(user: Any) -> Principal:
+    """Привести вход к ``Principal`` или отказать (fail closed).
+
+    ``None``/пустая строка/пустой список ролей -> ``AccessDeniedError``.
+    Заявленные роли не «доверяются»: роль выдаёт хранилище ACL, поэтому
+    подмена имени пользователя не меняет его прав.
+    """
+    if user is None:
+        raise AccessDeniedError("Идентичность пользователя не предоставлена")
+
+    if isinstance(user, Principal):
+        principal = user
+    elif isinstance(user, Mapping):
+        principal = Principal(
+            user_id=str(user.get("user_id") or user.get("username") or ""),
+            roles=tuple(user.get("roles") or ()),
+            trusted=bool(user.get("trusted", True)),
+        )
+    elif isinstance(user, (list, tuple, set)):
+        principal = Principal(user_id="", roles=tuple(user))
+    else:
+        principal = Principal(user_id=str(user or ""), roles=())
+
+    if not principal.trusted:
+        raise AccessDeniedError("Недоверенный источник идентичности", principal.user_id)
+    if not principal.has_roles:
+        raise AccessDeniedError(
+            "Отсутствуют роли доступа: доступ запрещён по умолчанию (Zero-Trust)",
+            principal.user_id,
+        )
+    return principal
+
+
+def _coerce_roles(value: Any) -> List[str]:
+    """Нормализовать ``allowed_roles`` из списка/строки/JSON-строки/``None``."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return []
+        if raw.startswith("["):
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                return [raw]
+            return [str(item).strip() for item in parsed if str(item or "").strip()] if isinstance(parsed, list) else [raw]
+        return [part.strip() for part in raw.split(",") if part.strip()]
+    if isinstance(value, Iterable):
+        return [str(item).strip() for item in value if str(item or "").strip()]
+    return [str(value).strip()]
+
+
+
+class AccessControlList:
+    """Zero-Trust ACL: deny-by-default, транзитивная иерархия, аудит отказов.
+
+    Источник данных — ``security/acl_storage.json`` (user -> roles, role -> perms).
+    Если файл отсутствует (например, исключён ``.dockerignore``, F-14), кэш ролей
+    остаётся пустым и **все** запросы отклоняются — это осознанное поведение
+    «отказ всем», а не тихий полный доступ.
+    """
+
+    def __init__(self, settings: Optional[Settings] = None, storage_path: Optional[Path] = None) -> None:
+        self.settings = settings or get_settings()
+        self.security_config = self.settings.security_config
+        self.acl_enabled: bool = bool(self.security_config.ACL_ENABLED)
+        self.role_hierarchy: Dict[str, List[str]] = dict(self.security_config.ROLE_HIERARCHY)
+
+        self.storage_path = Path(storage_path) if storage_path else Path(__file__).parent / "acl_storage.json"
+
+        self._user_roles_cache: Dict[str, Set[str]] = {}
+        self._role_perms_cache: Dict[str, Set[str]] = {}
+        self._metadata_cache: Dict[str, Dict[str, Any]] = {}
+
+        self._load_role_permissions()
+        self._load_acl_storage()
+        self._load_metadata_cache()
+
+    # ------------------------------------------------------------------
+    # Загрузка внешних данных
+    # ------------------------------------------------------------------
+    def _read_storage(self) -> Dict[str, Any]:
+        if not self.storage_path.exists():
+            # F-14: молча исключённый файл не должен открывать доступ.
+            logger.warning(
+                "ACL storage не найден: %s. Режим строгого Zero-Trust: доступ запрещён всем.",
+                self.storage_path,
+            )
+            return {}
+        with open(self.storage_path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def _load_role_permissions(self) -> None:
+        try:
+            data = self._read_storage()
+            for role, permissions in data.get("roles", {}).items():
+                self._role_perms_cache[str(role)] = {str(p) for p in permissions}
+            if data:
+                logger.info("Разрешения ролей загружены: %d ролей.", len(self._role_perms_cache))
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.error("Не удалось загрузить разрешения ролей: %s", exc)
+
+    def _load_acl_storage(self) -> None:
+        try:
+            data = self._read_storage()
+            for user_id, roles in data.get("users", {}).items():
+                self._user_roles_cache[str(user_id)] = {str(r) for r in roles}
+            if data:
+                logger.info(
+                    "ACL-хранилище пользователей загружено: %d пользователей.",
+                    len(self._user_roles_cache),
+                )
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.error("Не удалось загрузить acl_storage.json: %s", exc)
+
+    def _load_metadata_cache(self) -> None:
+        """Предзагрузка метаданных документов (исторический N+1-кэш)."""
+        store = Path(__file__).parent / "acl_metadata_cache.json"
+        if not store.exists():
+            return
+        try:
+            with open(store, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            for doc in data.get("documents", []):
+                doc_id = doc.get("doc_id")
+                if doc_id:
+                    self._metadata_cache[str(doc_id)] = doc.get("metadata", {})
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.error("Не удалось загрузить кэш метаданных ACL: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Роли
+    # ------------------------------------------------------------------
+    def get_effective_roles(self, user_id: str) -> Set[str]:
+        """Эффективные роли пользователя с транзитивной иерархией и защитой от циклов."""
+        base_roles = self._user_roles_cache.get((user_id or "").strip(), set())
+        if not base_roles:
+            return set()
+
+        effective: Set[str] = set(base_roles)
+        queue: List[str] = list(base_roles)
+        visited: Set[str] = set()
+
+        while queue:
+            current = queue.pop(0)
+            if current in visited:
+                continue
+            visited.add(current)
+            for sub_role in self.role_hierarchy.get(current, []):
+                if sub_role not in visited:
+                    effective.add(sub_role)
+                    queue.append(sub_role)
+        return effective
+
+    def role_exists(self, role: str) -> bool:
+        return role in self.role_hierarchy or role in self._role_perms_cache
+
+    # ------------------------------------------------------------------
+    # Проверки доступа
+    # ------------------------------------------------------------------
+    def _log_access_denied(self, user_id: str, target: str, reason: str) -> None:
+        """Аудит отказа. Содержимое документа никогда не логируется."""
+        logger.warning(
+            "AUDIT_ACCESS_DENIED | user=%r | target=%r | reason=%r",
+            user_id,
+            target,
+            reason,
+        )
+
+    def extract_document_roles(self, metadata: Any) -> List[str]:
+        """Достать ``allowed_roles`` из метаданных (dict, объект или JSON-строка Chroma)."""
+        if metadata is None:
+            return []
+        if isinstance(metadata, Mapping):
+            return _coerce_roles(metadata.get("allowed_roles"))
+        if isinstance(metadata, str):
+            try:
+                parsed = json.loads(metadata)
+            except json.JSONDecodeError:
+                return _coerce_roles(metadata)
+            return _coerce_roles(parsed.get("allowed_roles") if isinstance(parsed, Mapping) else None)
+        return _coerce_roles(getattr(metadata, "allowed_roles", None))
+
+    def chunk_is_accessible(self, allowed_roles: Sequence[str], user_roles: Set[str]) -> bool:
+        """Единственная точка решения по чанку. Пустые значения -> отказ (fail closed).
+
+        Именно здесь раньше возникал обход ACL (F-05): прежний код выполнял
+        проверку только когда ``doc_roles`` и ``user_role`` были оба truthy.
+        """
+        doc_roles = {str(r).strip() for r in (allowed_roles or []) if str(r or "").strip()}
+        if not doc_roles:
+            return False
+        if not user_roles:
+            return False
+        return bool(doc_roles & user_roles)
+
+    def validate_chunk_metadata(self, chunk: Any) -> bool:
+        """Валидация контракта индексации как чистый предикат.
+
+        Раньше метод бросал ``ACLValidationError`` в середине ingestion; теперь
+        возвращает ``False``, а исключение доступно через ``assert_chunk_metadata``.
+        """
+        if not isinstance(chunk, Mapping):
+            logger.error("ACL: метаданные чанка имеют неверный тип %s", type(chunk).__name__)
+            return False
+        if "allowed_roles" not in chunk:
+            logger.error("ACL: чанк без поля 'allowed_roles' — индексация запрещена.")
+            return False
+        if not _coerce_roles(chunk.get("allowed_roles")):
+            logger.error("ACL: пустой 'allowed_roles' — индексация запрещена (Zero-Trust).")
+            return False
+        return True
+
+    def assert_chunk_metadata(self, chunk: Any) -> None:
+        """Строгий вариант: бросает ``ACLValidationError`` при нарушении контракта."""
+        if not isinstance(chunk, Mapping):
+            raise ACLValidationError(
+                f"Метаданные чанка должны быть Mapping, получено {type(chunk).__name__}"
+            )
+        if not _coerce_roles(chunk.get("allowed_roles")):
+            raise ACLValidationError(
+                "Чанк без непустого 'allowed_roles' индексировать запрещено (Zero-Trust)."
+            )
+
+    def build_where_filter(self, user_roles: Iterable[str]) -> Dict[str, Any]:
+        """Фильтр ChromaDB по разрешённым ролям. Пустые роли -> заведомо ложный фильтр."""
+        roles = sorted({str(r).strip() for r in user_roles if str(r or "").strip()})
+        if not roles:
+            # Ни одна запись не должна совпасть: выражаем «ложь» через значение,
+            # которое не является валидной ролью.
+            return {"allowed_roles": {"$eq": "__acl_deny_all__"}}
+        return {"allowed_roles": {"$in": roles}}
+
+    def authorize(self, principal: Principal) -> Set[str]:
+        """Проверить личность и вернуть эффективные роли, иначе отказать (fail closed)."""
+        if not self.acl_enabled:
+            logger.warning("ACL отключён конфигурацией — доступ выдан без проверки ролей.")
+            return set(principal.roles)
+        roles = self.get_effective_roles(principal.user_id)
+        if not roles:
+            self._log_access_denied(principal.user_id, "<search>", "нет назначенных ролей")
+            raise AccessDeniedError("Доступ запрещён: пользователю не назначены роли", principal.user_id)
+        return roles
+
+
+    def validate_user_access(self, user_id: str, doc_ids: Sequence[str]) -> Dict[str, Any]:
+        """Проверка доступа к документам по кэшу метаданных (deny-by-default)."""
+        user_roles = self.get_effective_roles(user_id)
+        if not user_roles:
+            for doc_id in doc_ids:
+                self._log_access_denied(user_id, doc_id, "пользователю не назначены роли")
+            return {
+                "allowed": False,
+                "accessible_doc_ids": [],
+                "denied_doc_ids": list(doc_ids),
+                "user_roles": [],
+                "reason": "User has no roles assigned",
+            }
+
+        accessible: List[str] = []
+        denied: List[str] = []
+
+        for doc_id in doc_ids:
+            metadata = self._metadata_cache.get(doc_id)
+            if not metadata:
+                self._log_access_denied(user_id, doc_id, "метаданные документа не найдены")
+                denied.append(doc_id)
+                continue
+
+            doc_roles = _coerce_roles(metadata.get("allowed_roles"))
+            if not doc_roles:
+                self._log_access_denied(user_id, doc_id, "пустой allowed_roles (Zero-Trust deny)")
+                denied.append(doc_id)
+                continue
+
+            doc_department = metadata.get("department")
+            user_department = metadata.get("user_department")
+            if doc_department and user_department and doc_department != user_department:
+                self._log_access_denied(
+                    user_id, doc_id, f"несовпадение департамента: {user_department} != {doc_department}"
+                )
+                denied.append(doc_id)
+                continue
+
+            if self.chunk_is_accessible(doc_roles, user_roles):
+                accessible.append(doc_id)
+            else:
+                self._log_access_denied(user_id, doc_id, "недостаточно ролей")
+                denied.append(doc_id)
+
+        return {
+            "allowed": bool(accessible),
+            "accessible_doc_ids": accessible,
+            "denied_doc_ids": denied,
+            "user_roles": sorted(user_roles),
+            "accessible_documents_count": len(accessible),
+            "denied_documents_count": len(denied),
+        }
+
+    # ------------------------------------------------------------------
+    # Административные операции (кэш в памяти)
+    # ------------------------------------------------------------------
+    def add_role_to_user(self, user_id: str, role: str) -> bool:
+        self._user_roles_cache.setdefault(user_id, set()).add(role)
+        return True
+
+    def remove_role_from_user(self, user_id: str, role: str) -> bool:
+        roles = self._user_roles_cache.get(user_id)
+        if roles and role in roles:
+            roles.discard(role)
+            return True
+        return False
+
+    def clear_role_cache(self) -> None:
+        self._user_roles_cache.clear()
+        self._role_perms_cache.clear()
+        self._metadata_cache.clear()
+
+    def known_users(self) -> List[str]:
+        """Список пользователей из ACL (для health-диагностики, без ролей)."""
+        return sorted(self._user_roles_cache)
+
+    def roles_of(self, user_id: str) -> List[str]:
+        return sorted(self._user_roles_cache.get(user_id, set()))
+
+        return role in self.role_hierarchy or role in self._role_perms_cache
+
+
+
+class AccessValidator:
+    """Единый Zero-Trust ingest-gate: редакция секретов + проверка ACL-метаданных.
+
+    Раньше класс жил в ``ingestion/loader.py``, а ``storage/vector_db.py``
+    импортировал его из ``security.acl``, откуда его не существовало (F-03).
+    Теперь каноническое расположение — здесь, а ``ingestion`` его ре-экспортирует.
+
+    Обязательность: документ с CRITICAL-секретами или без валидного
+    ``allowed_roles`` **не индексируется**.
+    """
+
+    def __init__(self, acl: Optional[AccessControlList] = None) -> None:
+        self.acl = acl or AccessControlList()
+
+    def validate_document_for_indexing(
+        self,
+        doc_id: str,
+        text: str,
+        metadata: Any,
+        user_id: str,
+    ) -> Dict[str, Any]:
+        """Проверить документ перед индексацией.
+
+        Возвращает вердикт с ``cleaned_text`` — текстом, который РАЗРЕШЕНО
+        индексировать. Потребитель обязан использовать именно его (F-09).
+        """
+        result: Dict[str, Any] = {
+            "doc_id": doc_id,
+            "valid": True,
+            "cleaned_text": text,
+            "issues": [],
+            "redactions_applied": [],
+            "max_severity": "LOW",
+            "acl_ok": False,
+        }
+
+        if not isinstance(text, str):
+            text = "" if text is None else str(text)
+
+        metadata_dict = metadata if isinstance(metadata, Mapping) else {}
+
+        # 1. Обязательный redaction-gate.
+        try:
+            cleaned_text, redactions, max_severity = process_text(text, mode="redact")
+            result["cleaned_text"] = cleaned_text
+            result["redactions_applied"] = redactions
+            result["max_severity"] = max_severity
+        except Exception as exc:  # сканер сломался — индексировать нельзя
+            result["valid"] = False
+            result["issues"].append(
+                {
+                    "type": "Redaction_Error",
+                    "message": f"Ошибка редактирования текста: {exc}",
+                    "severity": "CRITICAL",
+                    "action_required": True,
+                }
+            )
+            return result
+
+        # 2. Жёсткий блок при обнаружении секретов класса CRITICAL.
+        if max_severity == "CRITICAL":
+            result["valid"] = False
+            result["issues"].append(
+                {
+                    "type": "Critical_Security_Violation",
+                    "message": "Обнаружены секреты/токены (CRITICAL). Документ заблокирован.",
+                    "severity": "CRITICAL",
+                    "action_required": True,
+                }
+            )
+            return result
+
+        if redactions:
+            result["issues"].append(
+                {
+                    "type": "Sensitive_Data_Redacted",
+                    "message": f"Применено редакций: {len(redactions)} (severity={max_severity}).",
+                    "severity": max_severity,
+                    "action_required": False,
+                }
+            )
+
+        # 3. Обязательные ACL-метаданные.
+        acl_ok = self.acl.validate_chunk_metadata(metadata_dict)
+        result["acl_ok"] = acl_ok
+        if not acl_ok:
+            result["valid"] = False
+            result["issues"].append(
+                {
+                    "type": "Missing_Access_Control",
+                    "message": "В метаданных отсутствует непустое поле 'allowed_roles'.",
+                    "severity": "CRITICAL",
+                    "action_required": True,
+                }
+            )
+
+        return result

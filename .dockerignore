@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+dist/
+build/
+*.egg-info/
+
+# Local data & state
+data/
+models/
+audit_logs/
+metrics/
+security/acl_storage.json
+
+# Environment
+.env
+.DS_Store

@@ -1,0 +1,200 @@
+# Modern Multi-Stage Retrieval Pipeline Configuration
+# Architecture: Modular ETL with async execution, metrics collection, and fault tolerance
+
+pipeline:
+  name: "enterprise-retrieval-pipeline"
+  version: "2.0.0"
+  description: "Production-grade retrieval pipeline with modular stages and observability"
+
+execution:
+  # Async processing settings
+  mode: "async"  # async or sync
+  max_concurrent_stages: 5
+  backpressure_enabled: true
+  
+  # Timeout & retry configuration
+  stage_timeout_seconds: 30
+  global_timeout_seconds: 120
+  max_retries_per_stage: 3
+  retry_backoff_multiplier: 2.0
+  
+  # Circuit breaker settings for resilience
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 5
+    reset_timeout_seconds: 60
+    half_open_requests: 3
+
+stages:
+  ingest:
+    description: "Load raw documents from external sources"
+    enabled: true
+    config:
+      # Source configuration (database, API, file system)
+      source_type: "vector_database"  # options: vector_db, es, api, local_files
+      batch_size: 100
+      concurrency: 4
+      
+      # Connection settings for external sources
+      connection:
+        host: "${VECTOR_DB_HOST}"
+        port: ${VECTOR_DB_PORT}
+        timeout_ms: 5000
+        
+      # Filtering at ingestion (preprocessing)
+      pre_filter:
+        min_length_chars: 10
+        max_length_chars: 100000
+        remove_empty: true
+
+  transform:
+    description: "Text preprocessing and normalization"
+    enabled: true
+    config:
+      # Tokenization settings
+      tokenizer: "sentencepiece"  # sentencepiece, spacy, nltk
+      language_model: "en_core_web_sm"
+      
+      # Normalization rules
+      normalization:
+        lowercase: true
+        remove_punctuation: false
+        remove_numbers: false
+        normalize_whitespace: true
+        
+      # Stopword removal
+      stopwords: ["common_en", "domain_specific"]
+      
+      # Deduplication settings
+      dedupe:
+        enabled: true
+        similarity_threshold: 0.95
+        method: "cosine"
+
+  embed:
+    description: "Generate vector embeddings"
+    enabled: true
+    config:
+      model: "sentence-transformers/all-MiniLM-L6-v2"  # or BGE-base-en, E5-large
+      device: "auto"  # auto, cpu, cuda
+      normalize_embeddings: true
+      
+      # Batch processing settings
+      batch_size: 32
+      max_tokens_per_batch: 8192
+      
+      # Caching for repeated queries
+      cache:
+        enabled: true
+        ttl_seconds: 86400
+
+  retrieve:
+    description: "Vector similarity search"
+    enabled: true
+    config:
+      # Search parameters
+      top_k: 10
+      filter_threshold: 0.75
+      
+      # Similarity metric
+      metric: "cosine"  # cosine, euclidean, dot_product
+      
+      # HNSW indexing settings (for approximate nearest neighbor)
+      hnsw:
+        enabled: true
+        ef_search: 64
+        M: 16
+        
+      # Post-filtering
+      post_filter:
+        enabled: true
+        min_score: 0.75
+
+  rerank:
+    description: "Cross-encoder reranking"
+    enabled: true
+    config:
+      model: "BAAI/bge-reranker-base"  # or cross-encoder/ms-marco-MiniLM-L-12-v2
+      top_n_candidates: 50
+      
+      # Reranking settings
+      normalize_scores: true
+      temperature: 1.0
+      
+      # Batch processing for reranking
+      batch_size: 16
+
+  filter:
+    description: "Apply filters and quality gates"
+    enabled: true
+    config:
+      thresholds:
+        min_relevance_score: 0.70
+        max_age_days: 365
+        
+      # Multi-criteria filtering
+      criteria:
+        - type: "score_threshold"
+          field: "rerank"
+          operator: ">="
+          value: 0.70
+          
+        - type: "metadata_filter"
+          key: "verified"
+          operator: "==true"
+          
+        - type: "content_quality"
+          min_word_count: 50
+          stopword_ratio_max: 0.3
+
+  format:
+    description: "Final output formatting for API/LLM"
+    enabled: true
+    config:
+      # Output format
+      format_type: "json"  # json, markdown, structured
+      
+      # Metadata to include
+      include_metadata:
+        - id
+        - scores
+        - metadata.source
+        - metadata.timestamp
+        
+      # Truncation settings
+      max_content_length: 500
+      truncate_with_ellipsis: true
+      
+      # Sorting for final output
+      sort_by: "rerank"
+      descending: true
+
+monitoring:
+  metrics_collection:
+    enabled: true
+    collection_interval_seconds: 10
+    
+  logging:
+    level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+    format: "json"  # json, text
+    output_dir: "${LOGS_DIR}"
+    
+  observability:
+    prometheus:
+      enabled: true
+      endpoint: "/metrics"
+      
+    tracing:
+      enabled: false
+      provider: "jaeger"
+
+alerts:
+  error_rate_threshold: 0.10
+  latency_p99_threshold_ms: 5000
+  throughput_min_docs_per_sec: 10
+  
+notification_channels:
+  - type: "slack"
+    channel: "#ops-alerts"
+  - type: "email"
+    recipients: ["team@example.com"]

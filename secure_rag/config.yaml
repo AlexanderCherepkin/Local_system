@@ -1,0 +1,11 @@
+# Secure RAG Configuration
+rag:
+  embedding_model: "BAAI/bge-m3"
+  vector_store: "chroma"
+  chunk_size: 1024
+  chunk_overlap: 50
+  
+security:
+  encryption: true
+  access_control: true
+  audit_logging: true
